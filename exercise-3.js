@@ -1,95 +1,165 @@
 const sqlite3 = require('sqlite3').verbose();
+const nodemailer = require('nodemailer');
 
 let db = new sqlite3.Database(':memory:');
 
-function checkRateLimit(userId, type, callback) {
-    db.get("SELECT count(*) as count FROM notifications WHERE user_id = ? AND type = ? AND timestamp >= datetime('now', '-' || (SELECT interval || 's' FROM rate_limits WHERE type = ?))", [userId, type, type], (err, row) => {
-        if (err) {
-            callback(err, null);
-            return;
-        }
-        const count = row.count;
-        db.get("SELECT limit_count FROM rate_limits WHERE type = ?", [type], (err, row) => {
-            if (err) {
-                callback(err, null);
-                return;
-            }
-            const limitCount = row.limit_count;
-            if (count < limitCount) {
-                callback(null, true);
-            } else {
-                callback(null, false);
-            }
-        });
+db.run(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS notification_types (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS rate_limits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    notification_type_id INTEGER NOT NULL,
+    interval TEXT NOT NULL,
+    limit_count INTEGER NOT NULL,
+    FOREIGN KEY (notification_type_id) REFERENCES notification_types(id)
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    notification_type_id INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (notification_type_id) REFERENCES notification_types(id)
+  )
+`);
+
+function checkRateLimit(userId, notificationType, callback) {
+  const sql = `
+    SELECT rl.limit_count, rl.interval, nt.id AS notification_type_id
+    FROM rate_limits AS rl
+    INNER JOIN notification_types AS nt ON rl.notification_type_id = nt.id
+    WHERE nt.name = ?
+  `;
+
+  db.get(sql, [notificationType], (err, row) => {
+    if (err) {
+      callback(err, null);
+      return;
+    }
+
+    if (!row) {
+      callback(new Error('Invalid notification type'), null);
+      return;
+    }
+
+    const limitCount = row.limit_count;
+    const interval = row.interval;
+    const notificationTypeId = row.notification_type_id;
+
+    const windowStart = calculateWindowStart(interval);
+
+    const countSql = `
+      SELECT COUNT(*) AS count
+      FROM notifications
+      WHERE user_id = ? AND notification_type_id = ? AND timestamp >= ?
+    `;
+
+    db.get(countSql, [userId, notificationTypeId, windowStart], (err, countRow) => {
+      if (err) {
+        callback(err, null);
+        return;
+      }
+
+      const notificationCount = countRow.count;
+
+      if (notificationCount >= limitCount) {
+        callback(new Error('Rate limit exceeded for this notification type'), null);
+      } else {
+        callback(null, true);
+      }
     });
+  });
 }
 
-function sendNotification(userId, type, message, callback) {
-    checkRateLimit(userId, type, (err, canSend) => {
-        if (err) {
-            callback(err);
-            return;
-        }
-        if (canSend) {
-            db.run("INSERT INTO notifications (user_id, type, message, timestamp) VALUES (?, ?, ?, datetime('now'))", [userId, type, message], (err) => {
-                if (err) {
-                    callback(err);
-                    return;
-                }
-                callback(null);
-            });
-        } else {
-            callback(new Error("El usuario ha alcanzado el límite de velocidad para este tipo de notificación."));
-        }
+function sendNotification(userId, notificationType, message, callback) {
+  getUser(userId, (err, user) => {
+    if (err) {
+      callback(err);
+      return;
+    }
+
+    if (!user) {
+      callback(new Error('User not found'));
+      return;
+    }
+
+    const userEmail = user.email;
+
+    const mailOptions = {
+      from: 'mrsketchco@gmail.com',
+      to: userEmail,
+      subject: `Notification: ${notificationType}`,
+      text: message,
+    };
+
+    transporter.sendMail(mailOptions, (error, info) => {
+      if (error) {
+        callback(error);
+        return;
+      }
+
+      console.log('Notification sent successfully:', info.response);
+      callback(null);
     });
+  });
 }
 
 const userId = 1;
-const type = "news";
-const message = "¡Nueva noticia!";
+const notificationType = 'News';
+const message = 'Daily news update!';
 
-sendNotification(userId, type, message, (err) => {
-    if (err) {
-        console.error("Error al enviar la notificación:", err.message);
-    } else {
-        console.log("Notificación enviada correctamente.");
-    }
+checkRateLimit(userId, notificationType, (err, canSend) => {
+  if (err) {
+    console.error('Error checking rate limit:', err.message);
+  } else if (canSend) {
+    sendNotification(userId, notificationType, message, (err) => {
+      if (err) {
+        console.error('Error sending notification:', err.message);
+      } else {
+        console.log('Notification sent successfully!');
+      }
+    });
+  } else {
+    console.log('Rate limit exceeded for News notifications.');
+  }
 });
 
-function sendNotificationsUntilLimitReached(userId, type, message, limitCount, callback) {
-    // Verificar el límite de velocidad actual para el usuario y el tipo de notificación
-    checkRateLimit(userId, type, (err, canSend) => {
-        if (err) {
-            // Manejar errores de la verificación del límite de velocidad
-            callback(err);
-            return;
-        }
-        
-        // Si se puede enviar la notificación según el límite de velocidad actual
-        if (canSend) {
-            // Enviar la notificación
-            sendNotification(userId, type, message, (err) => {
-                if (err) {
-                    // Manejar errores al enviar la notificación
-                    callback(err);
-                } else {
-                    // Incrementar el contador de notificaciones enviadas
-                    limitCount--;
-                    // Verificar si se ha alcanzado el límite de velocidad
-                    if (limitCount > 0) {
-                        // Si no se ha alcanzado el límite, enviar más notificaciones recursivamente
-                        sendNotificationsUntilLimitReached(userId, type, message, limitCount, callback);
-                    } else {
-                        // Si se ha alcanzado el límite, devolver un mensaje de éxito
-                        callback(null, "El límite de velocidad se alcanzó correctamente.");
-                    }
-                }
-            });
-        } else {
-            // Si no se puede enviar la notificación debido al límite de velocidad, devolver un mensaje de error
-            callback(new Error("El usuario ha alcanzado el límite de velocidad para este tipo de notificación."));
-        }
-    });
+function calculateWindowStart(interval) {
+  const now = new Date();
+
+  switch (interval) {
+    case 'minute':
+      now.setMinutes(now.getMinutes() - 1);
+      break;
+    case 'hour':
+      now.setHours(now.getHours() - 1);
+      break;
+    case 'day':
+      now.setDate(now.getDate() - 1);
+      break;
+    default:
+      throw new Error('Invalid interval unit');
+  }
+
+  return now.toISOString();
 }
 
 db.close();
